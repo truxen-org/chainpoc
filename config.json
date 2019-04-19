@@ -1,0 +1,24 @@
+{
+    "Ver": "0.3.1",
+    "BaseDir": "/home/lilu/test/cp1",
+    "OutboundPort": 10101,
+    "Debug": true,
+    "IsMiner": true,
+    "PCRs": [
+        "00000001000b03000406002083abfa3e0ed0df1130c487f17e164156308ec1faa432184a23a2a965f5898660",
+        "00000001000b030004060020fb299765105da0d15136b055b329c62e42e9db4d795dadac0b2a90e236143945"
+    ],
+    "Signers": [
+        "6401e0ff6ce1f10c447c227307946e1ea21da32a"
+    ],
+    "DBCache": 1024,
+    "NodeCache": 5000,
+    "Profile": false,
+    "StartMining": true,
+    "StartMiningOnTx": false,
+    "GenAddr": false,
+    "UseUPnP": false,
+    "UseSeed": false,
+    "DefautPeer": "",
+    "ConnectPeer": "192.168.1.173:10101"
+}

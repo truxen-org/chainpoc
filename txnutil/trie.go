@@ -1,0 +1,509 @@
+package txnutil
+
+import (
+	"fmt"
+	"log"
+	"reflect"
+)
+
+// TODO
+// A StateObject is an object that has a state root
+// This is goig to be the object for the second level caching (the caching of object which have a state such as contracts)
+type StateObject interface {
+	State() *Trie
+	Sync()
+	Undo()
+}
+
+type Node struct {
+	Key   []byte
+	Value *Value
+	Dirty bool
+}
+
+func NewNode(key []byte, val *Value, dirty bool) *Node {
+	return &Node{Key: key, Value: val, Dirty: dirty}
+}
+
+func (n *Node) Copy() *Node {
+	return NewNode(n.Key, n.Value, n.Dirty)
+}
+
+type Cache struct {
+	nodes   map[string]*Node
+	db      Database
+	IsDirty bool
+}
+
+func NewCache(db Database) *Cache {
+	return &Cache{db: db, nodes: make(map[string]*Node)}
+}
+
+func (cache *Cache) Clear() {
+	log.Println("cache.nodes", len(cache.nodes))
+	cache.nodes = make(map[string]*Node)
+}
+
+func (cache *Cache) Put(v interface{}) interface{} {
+	value := NewValue(v)
+
+	enc := value.Encode()
+	if len(enc) >= 32 {
+		sha := Sha3Bin(enc)
+
+		cache.nodes[string(sha)] = NewNode(sha, value, true)
+		cache.IsDirty = true
+
+		return sha
+	}
+
+	return v
+}
+
+func (cache *Cache) Get(key []byte) *Value {
+	// First check if the key is the cache
+	if cache.nodes[string(key)] != nil {
+		return cache.nodes[string(key)].Value
+	}
+
+	// Get the key of the database instead and cache it
+	data, _ := cache.db.Get(key)
+	// Create the cached value
+	value := NewValueFromBytes(data)
+	// Create caching node
+	cache.nodes[string(key)] = NewNode(key, value, false)
+
+	return value
+}
+
+func (cache *Cache) Delete(key []byte) {
+	delete(cache.nodes, string(key))
+
+	cache.db.Delete(key)
+}
+
+func (cache *Cache) Commit() {
+	// Don't try to commit if it isn't dirty
+	if !cache.IsDirty {
+		return
+	}
+
+	for key, node := range cache.nodes {
+		if node.Dirty {
+			cache.db.Put([]byte(key), node.Value.Encode())
+			// Log.Debugf("commit key=%x, value=%x", key, node.Value.Encode())
+			node.Dirty = false
+		}
+	}
+	cache.IsDirty = false
+
+	// If the nodes grows beyond the 200 entries we simple empty it
+	// FIXME come up with something better
+	if len(cache.nodes) > Config.NodeCache {
+		log.Printf(">>>>>>>>clear cache.nodes: %d", len(cache.nodes))
+		cache.nodes = make(map[string]*Node)
+	}
+}
+
+func (cache *Cache) Undo() {
+	for key, node := range cache.nodes {
+		if node.Dirty {
+			Log.Debugf("undo key=%x", key)
+			delete(cache.nodes, key)
+		}
+	}
+	cache.IsDirty = false
+}
+
+// A (modified) Radix Trie implementation. The Trie implements
+// a caching mechanism and will used cached values if they are
+// present. If a node is not present in the cache it will try to
+// fetch it from the database and store the cached value.
+// Please note that the data isn't persisted unless `Sync` is
+// explicitly called.
+type Trie struct {
+	prevRoot interface{}
+	Root     interface{}
+	//db   Database
+	cache *Cache
+}
+
+func NewTrie(db Database, Root interface{}) *Trie {
+	return &Trie{cache: NewCache(db), Root: Root, prevRoot: Root}
+}
+
+// Save the cached value to the database.
+func (t *Trie) Sync() {
+	t.cache.Commit()
+	t.prevRoot = t.Root
+}
+
+func (t *Trie) Undo() {
+	t.cache.Undo()
+	t.Root = t.prevRoot
+}
+
+func (t *Trie) Cache() *Cache {
+	return t.cache
+}
+
+/*
+ * Public (query) interface functions
+ */
+func (t *Trie) Update(key string, value string) {
+	k := CompactHexDecode(key)
+
+	t.Root = t.UpdateState(t.Root, k, value)
+}
+
+func (t *Trie) Get(key string) string {
+	k := CompactHexDecode(key)
+	c := NewValue(t.GetState(t.Root, k))
+
+	return c.Str()
+}
+
+func (t *Trie) Delete(key string) {
+	t.Update(key, "")
+}
+
+func (t *Trie) GetState(node interface{}, key []int) interface{} {
+	n := NewValue(node)
+	// Return the node if key is empty (= found)
+	if len(key) == 0 || n.IsNil() || n.Len() == 0 {
+		return node
+	}
+
+	currentNode := t.GetNode(node)
+	length := currentNode.Len()
+
+	if length == 0 {
+		return ""
+	} else if length == 2 {
+		// Decode the key
+		k := CompactDecode(currentNode.Get(0).Str())
+		v := currentNode.Get(1).Raw()
+
+		if len(key) >= len(k) && CompareIntSlice(k, key[:len(k)]) {
+			return t.GetState(v, key[len(k):])
+		} else {
+			return ""
+		}
+	} else if length == 17 {
+		return t.GetState(currentNode.Get(key[0]).Raw(), key[1:])
+	}
+
+	// It shouldn't come this far
+	fmt.Println("GetState unexpected return")
+	return ""
+}
+
+func (t *Trie) GetNode(node interface{}) *Value {
+	n := NewValue(node)
+
+	if !n.Get(0).IsNil() {
+		return n
+	}
+
+	str := n.Str()
+	if len(str) == 0 {
+		return n
+	} else if len(str) < 32 {
+		return NewValueFromBytes([]byte(str))
+	}
+
+	return t.cache.Get(n.Bytes())
+}
+
+func (t *Trie) UpdateState(node interface{}, key []int, value string) interface{} {
+
+	if value != "" {
+		return t.InsertState(node, key, value)
+	} else {
+		// delete it
+		return t.DeleteState(node, key)
+	}
+
+	return t.Root
+}
+
+func (t *Trie) Put(node interface{}) interface{} {
+	/*
+		enc := Encode(node)
+		if len(enc) >= 32 {
+			var sha []byte
+			sha = Sha3Bin(enc)
+			//t.db.Put([]byte(sha), enc)
+
+			return sha
+		}
+		return node
+	*/
+
+	/*
+		TODO?
+			c := Conv(t.Root)
+			fmt.Println(c.Type(), c.Length())
+			if c.Type() == reflect.String && c.AsString() == "" {
+				return enc
+			}
+	*/
+
+	return t.cache.Put(node)
+
+}
+
+func EmptyStringSlice(l int) []interface{} {
+	slice := make([]interface{}, l)
+	for i := 0; i < l; i++ {
+		slice[i] = ""
+	}
+	return slice
+}
+
+func (t *Trie) InsertState(node interface{}, key []int, value interface{}) interface{} {
+	if len(key) == 0 {
+		return value
+	}
+
+	// New node
+	n := NewValue(node)
+	if node == nil || (n.Type() == reflect.String && (n.Str() == "" || n.Get(0).IsNil())) || n.Len() == 0 {
+		newNode := []interface{}{CompactEncode(key), value}
+
+		return t.Put(newNode)
+	}
+
+	currentNode := t.GetNode(node)
+	// Check for "special" 2 slice type node
+	if currentNode.Len() == 2 {
+		// Decode the key
+
+		k := CompactDecode(currentNode.Get(0).Str())
+		v := currentNode.Get(1).Raw()
+
+		// Matching key pair (ie. there's already an object with this key)
+		if CompareIntSlice(k, key) {
+			newNode := []interface{}{CompactEncode(key), value}
+			return t.Put(newNode)
+		}
+
+		var newHash interface{}
+		matchingLength := MatchingNibbleLength(key, k)
+		if matchingLength == len(k) {
+			// Insert the hash, creating a new node
+			newHash = t.InsertState(v, key[matchingLength:], value)
+		} else {
+			// Expand the 2 length slice to a 17 length slice
+			oldNode := t.InsertState("", k[matchingLength+1:], v)
+			newNode := t.InsertState("", key[matchingLength+1:], value)
+			// Create an expanded slice
+			scaledSlice := EmptyStringSlice(17)
+			// Set the copied and new node
+			scaledSlice[k[matchingLength]] = oldNode
+			scaledSlice[key[matchingLength]] = newNode
+
+			newHash = t.Put(scaledSlice)
+		}
+
+		if matchingLength == 0 {
+			// End of the chain, return
+			return newHash
+		} else {
+			newNode := []interface{}{CompactEncode(key[:matchingLength]), newHash}
+			return t.Put(newNode)
+		}
+	} else {
+
+		// Copy the current node over to the new node and replace the first nibble in the key
+		newNode := EmptyStringSlice(17)
+
+		for i := 0; i < 17; i++ {
+			cpy := currentNode.Get(i).Raw()
+			if cpy != nil {
+				newNode[i] = cpy
+			}
+		}
+
+		newNode[key[0]] = t.InsertState(currentNode.Get(key[0]).Raw(), key[1:], value)
+
+		return t.Put(newNode)
+	}
+
+	return ""
+}
+
+func (t *Trie) DeleteState(node interface{}, key []int) interface{} {
+	if len(key) == 0 {
+		return ""
+	}
+
+	// New node
+	n := NewValue(node)
+	if node == nil || (n.Type() == reflect.String && (n.Str() == "" || n.Get(0).IsNil())) || n.Len() == 0 {
+		return ""
+	}
+
+	currentNode := t.GetNode(node)
+	// Check for "special" 2 slice type node
+	if currentNode.Len() == 2 {
+		// Decode the key
+		k := CompactDecode(currentNode.Get(0).Str())
+		v := currentNode.Get(1).Raw()
+
+		// Matching key pair (ie. there's already an object with this key)
+		if CompareIntSlice(k, key) {
+			return ""
+		} else if CompareIntSlice(key[:len(k)], k) {
+			hash := t.DeleteState(v, key[len(k):])
+			child := t.GetNode(hash)
+
+			var newNode []interface{}
+			if child.Len() == 2 {
+				newKey := append(k, CompactDecode(child.Get(0).Str())...)
+				newNode = []interface{}{CompactEncode(newKey), child.Get(1).Raw()}
+			} else {
+				newNode = []interface{}{currentNode.Get(0).Str(), hash}
+			}
+
+			return t.Put(newNode)
+		} else {
+			return node
+		}
+	} else {
+		// Copy the current node over to the new node and replace the first nibble in the key
+		n := EmptyStringSlice(17)
+		var newNode []interface{}
+
+		for i := 0; i < 17; i++ {
+			cpy := currentNode.Get(i).Raw()
+			if cpy != nil {
+				n[i] = cpy
+			}
+		}
+
+		n[key[0]] = t.DeleteState(n[key[0]], key[1:])
+		amount := -1
+		for i := 0; i < 17; i++ {
+			if n[i] != "" {
+				if amount == -1 {
+					amount = i
+				} else {
+					amount = -2
+				}
+			}
+		}
+		if amount == 16 {
+			newNode = []interface{}{CompactEncode([]int{16}), n[amount]}
+		} else if amount >= 0 {
+			child := t.GetNode(n[amount])
+			if child.Len() == 17 {
+				newNode = []interface{}{CompactEncode([]int{amount}), n[amount]}
+			} else if child.Len() == 2 {
+				key := append([]int{amount}, CompactDecode(child.Get(0).Str())...)
+				newNode = []interface{}{CompactEncode(key), child.Get(1).Str()}
+			}
+
+		} else {
+			newNode = n
+		}
+
+		return t.Put(newNode)
+	}
+
+	return ""
+}
+
+// Simple compare function which creates a rlp value out of the evaluated objects
+func (t *Trie) Cmp(trie *Trie) bool {
+	return NewValue(t.Root).Cmp(NewValue(trie.Root))
+}
+
+// Returns a copy of this trie
+func (t *Trie) Copy() *Trie {
+	trie := NewTrie(t.cache.db, t.Root)
+	for key, node := range t.cache.nodes {
+		trie.cache.nodes[key] = node.Copy()
+	}
+
+	return trie
+}
+
+type TrieIterator struct {
+	trie  *Trie
+	key   string
+	value string
+
+	shas   [][]byte
+	values []string
+}
+
+func (t *Trie) NewIterator() *TrieIterator {
+	return &TrieIterator{trie: t}
+}
+
+// Some time in the near future this will need refactoring :-)
+// XXX Note to self, IsSlice == inline node. Str == sha3 to node
+func (it *TrieIterator) workNode(currentNode *Value) {
+	if currentNode.Len() == 2 {
+		k := CompactDecode(currentNode.Get(0).Str())
+
+		if currentNode.Get(1).Str() == "" {
+			it.workNode(currentNode.Get(1))
+		} else {
+			if k[len(k)-1] == 16 {
+				it.values = append(it.values, currentNode.Get(1).Str())
+			} else {
+				it.shas = append(it.shas, currentNode.Get(1).Bytes())
+				it.getNode(currentNode.Get(1).Bytes())
+			}
+		}
+	} else {
+		for i := 0; i < currentNode.Len(); i++ {
+			if i == 16 && currentNode.Get(i).Len() != 0 {
+				it.values = append(it.values, currentNode.Get(i).Str())
+			} else {
+				if currentNode.Get(i).Str() == "" {
+					it.workNode(currentNode.Get(i))
+				} else {
+					val := currentNode.Get(i).Str()
+					if val != "" {
+						it.shas = append(it.shas, currentNode.Get(1).Bytes())
+						it.getNode([]byte(val))
+					}
+				}
+			}
+		}
+	}
+}
+
+func (it *TrieIterator) getNode(node []byte) {
+	currentNode := it.trie.cache.Get(node)
+	it.workNode(currentNode)
+}
+
+func (it *TrieIterator) Collect() [][]byte {
+	if it.trie.Root == "" {
+		return nil
+	}
+
+	it.getNode(NewValue(it.trie.Root).Bytes())
+
+	return it.shas
+}
+
+func (it *TrieIterator) Purge() int {
+	shas := it.Collect()
+	for _, sha := range shas {
+		it.trie.cache.Delete(sha)
+	}
+	return len(it.values)
+}
+
+func (it *TrieIterator) Key() string {
+	return ""
+}
+
+func (it *TrieIterator) Value() string {
+	return ""
+}
